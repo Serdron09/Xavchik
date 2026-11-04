@@ -1,0 +1,152 @@
+rules_version = '2';
+
+// Havchik — private app for a closed circle.
+// Everything is gated on being listed in /members. Joining requires the invite
+// code stored in /config/invite, which clients cannot read (get() inside rules
+// bypasses read rules; only admins are granted an actual read).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isMember() {
+      return signedIn() && exists(/databases/$(database)/documents/members/$(request.auth.uid));
+    }
+
+    function isAdmin() {
+      return isMember()
+        && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function inviteCode() {
+      return get(/databases/$(database)/documents/config/invite).data.code;
+    }
+
+    function adminClaimed() {
+      return get(/databases/$(database)/documents/config/invite).data.adminClaimed == true;
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    /* --------------------------------- config -------------------------------- */
+
+    match /config/invite {
+      allow read: if isAdmin();
+      // The very first member claims admin in the same batch that creates their
+      // member doc; allowed exactly once, and only for this one flag.
+      allow update: if signedIn()
+        && !adminClaimed()
+        && changedKeys().hasOnly(['adminClaimed'])
+        && request.resource.data.adminClaimed == true;
+      allow create, delete: if false;
+    }
+
+    match /config/{other} {
+      allow read, write: if false;
+    }
+
+    /* -------------------------------- members -------------------------------- */
+
+    match /members/{uid} {
+      allow read: if isMember();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.inviteCode == inviteCode()
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() > 0
+        && (request.resource.data.role == 'member'
+            || (request.resource.data.role == 'admin' && !adminClaimed()));
+
+      allow update: if isAdmin()
+        || (request.auth.uid == uid
+            && changedKeys().hasOnly(['displayName', 'lang', 'photoURL']));
+
+      allow delete: if isAdmin() && request.auth.uid != uid;
+    }
+
+    /* --------------------------- places and menus ---------------------------- */
+
+    match /places/{placeId} {
+      allow read: if isMember();
+      allow create: if isMember() && request.resource.data.createdBy == request.auth.uid;
+      // Any member may edit any place — a deliberate choice; updatedBy records who.
+      allow update: if isMember();
+      allow delete: if isAdmin() || (isMember() && resource.data.createdBy == request.auth.uid);
+
+      match /menuItems/{itemId} {
+        allow read: if isMember();
+        allow write: if isMember();
+      }
+    }
+
+    /* --------------------------------- polls --------------------------------- */
+
+    match /polls/{pollId} {
+      function pollData() {
+        return get(/databases/$(database)/documents/polls/$(pollId)).data;
+      }
+      function pollOwner() {
+        return isMember() && pollData().createdBy == request.auth.uid;
+      }
+
+      allow read: if isMember();
+      allow create: if isMember() && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isAdmin() || (isMember() && resource.data.createdBy == request.auth.uid);
+      allow delete: if isAdmin() || (isMember() && resource.data.createdBy == request.auth.uid);
+
+      match /votes/{uid} {
+        allow read: if isMember();
+        allow create, update: if isMember()
+          && request.auth.uid == uid
+          && pollData().status == 'open';
+        allow delete: if isMember() && (request.auth.uid == uid || isAdmin() || pollOwner());
+      }
+    }
+
+    /* -------------------------------- orders --------------------------------- */
+
+    match /orders/{orderId} {
+      function orderData() {
+        return get(/databases/$(database)/documents/orders/$(orderId)).data;
+      }
+      function orderOwner() {
+        return isMember() && orderData().createdBy == request.auth.uid;
+      }
+      function orderOpen() {
+        return orderData().status == 'open';
+      }
+
+      allow read: if isMember();
+      allow create: if isMember()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'open';
+      allow update: if isAdmin() || (isMember() && resource.data.createdBy == request.auth.uid);
+      allow delete: if isAdmin() || (isMember() && resource.data.createdBy == request.auth.uid);
+
+      match /items/{itemId} {
+        allow read: if isMember();
+
+        allow create: if isMember()
+          && request.resource.data.userId == request.auth.uid
+          && orderOpen();
+
+        // Own items while the order is open; the order's owner and admins may also
+        // fix someone else's line before phoning the restaurant.
+        allow update: if isMember()
+          && orderOpen()
+          && (resource.data.userId == request.auth.uid || isAdmin() || orderOwner());
+
+        // Admin / owner deletes are not gated on status, so deleting a whole
+        // locked order can clear its items in one batch.
+        allow delete: if isAdmin()
+          || orderOwner()
+          || (isMember() && resource.data.userId == request.auth.uid && orderOpen());
+      }
+    }
+  }
+}
